@@ -1,6 +1,7 @@
-# FlashDecky
 
-Turn any list into perfect, printable flash cards (8 per page, duplex-ready).
+# FlashDecky (v4.1)
+
+A simple Streamlit app to turn lists into duplex-ready flash cards (8 per page).
 
 ## Run locally
 
@@ -10,20 +11,12 @@ streamlit run app.py
 ```
 
 ## Features
-- Paste free-form text OR upload CSV/XLSX OR paste a tab-separated table
-- Smart parser for numbered/bulleted lists, wrapped definitions, dictionary formats (`term (pos) def`), `term : def`, `term — def`, tab-splits
-- Review & edit in an editable grid
-- PDF generator (ReportLab): 8 cards per US Letter, dashed cut lines
-- Duplex alignment:
-  - Long-edge (mirrored back) — default
-  - Long-edge (not mirrored)
-  - Short-edge
-- Fine-tune back page X/Y offsets (mm)
-- Optional footer per card with template: `{subject}`, `{lesson}`, `{unit}`, `{index}`, `{page}`
+- Paste text, upload CSV/XLSX, paste a table, or upload an image (PNG/JPG) to OCR.
+- Parsing supports numbered/bulleted lists, `:`, spaced dashes, and `term (pos) def`.
+- Review & edit grid (add/remove rows).
+- PDF generator (ReportLab) with 8 cards/page, dashed cut lines.
+- Duplex options: **Long-edge (not mirrored)** and **Short-edge**; X/Y back page offsets.
+- Optional footer with `{subject}`, `{lesson}`, `{unit}`, `{index}`, `{page}`.
 
-## Deploy on Streamlit Cloud
-- Push this folder to GitHub (e.g., `flashdecky/` repo)
-- On Streamlit Cloud, set:
-  - **Main file path:** `app.py`
-  - **Python version:** 3.10+
-  - **Dependencies:** from `requirements.txt`
+## OCR for images
+Add an OCR.space API key to Streamlit secrets as `OCR_SPACE_API_KEY`. Without a key, images cannot be parsed.

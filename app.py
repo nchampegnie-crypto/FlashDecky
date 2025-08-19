@@ -1,323 +1,368 @@
-# FlashDecky — Streamlit app
-# Ready-to-run, GitHub-friendly version
-#
-# Features:
-# - Paste free-form text OR upload CSV/XLSX OR paste a table (TSV)
-# - Smart parser for numbered/bulleted lists, separators, wrapped lines
-# - Editable review grid (Front/Back)
-# - PDF generator: 8 cards per US Letter, dashed cut lines
-# - Duplex modes: Long-edge (mirrored back), Long-edge (not mirrored), Short-edge
-# - Fine X/Y offsets for backs
-# - Footer template with {subject}, {lesson}, {unit}, {index}, {page}
 
 import io
+import os
 import re
 import math
+import json
+import requests
 import pandas as pd
 import streamlit as st
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
-
-# PDF
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-from reportlab.lib.units import inch
-from reportlab.pdfbase.pdfmetrics import stringWidth
-from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.colors import black
+from reportlab.lib.utils import ImageReader
 
-st.set_page_config(page_title="FlashDecky", layout="wide")
+# ---------------------
+# Helpers
+# ---------------------
 
-# ----------------------------- Parsing ----------------------------------
+def ocr_space(image_bytes, api_key):
+    """Return extracted text from OCR.space; None if it fails."""
+    try:
+        url = "https://api.ocr.space/parse/image"
+        files = {'filename': ('upload.png', image_bytes)}
+        data = {"language":"eng","isOverlayRequired":"false"}
+        if api_key:
+            data["apikey"] = api_key
+        else:
+            # public test key has strict limits; better to show a friendly error
+            return None, "No OCR API key configured. Add OCR_SPACE_API_KEY to Streamlit secrets."
+        r = requests.post(url, files=files, data=data, timeout=60)
+        r.raise_for_status()
+        js = r.json()
+        if js.get("IsErroredOnProcessing"):
+            return None, js.get("ErrorMessage") or "OCR processing error"
+        text = "".join(p.get("ParsedText","") for p in js.get("ParsedResults",[]))
+        return text, None
+    except Exception as e:
+        return None, str(e)
 
-ROW_START_RE = re.compile(r"^\s*(?:\d+[\.\)]\s+|[-*•]\s+)")  # numbered or bullet
-SEP_TAB = "\t"
-SEP_DASH = re.compile(r"\s[-–—]\s")  # space-dash-space variants
-PARENS = re.compile(r"\(.*?\)")
-
-def _split_term_def(line: str) -> Tuple[str, str]:
-    # Priority: tab, colon (not inside parens), spaced dash, dictionary (term (pos) definition)
-    if SEP_TAB in line:
-        parts = line.split(SEP_TAB, 1)
-        return parts[0].strip(), parts[1].strip()
-    # colon not in parentheses
-    # find first ":" not between parentheses
-    depth = 0
-    for i, ch in enumerate(line):
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth = max(0, depth - 1)
-        elif ch == ":" and depth == 0:
-            return line[:i].strip(), line[i+1:].strip()
-    # spaced dash
-    m = SEP_DASH.search(line)
-    if m:
-        i = m.start()
-        return line[:i].strip(), line[m.end():].strip()
-    # dictionary: term (pos) def
-    # term = up to first close paren then space
-    m2 = re.match(r"^\s*([^\(]+)\s*\(.*?\)\s+(.*)$", line)
-    if m2:
-        return m2.group(1).strip(), m2.group(2).strip()
-    # fallback: first space split
-    parts = line.split(None, 1)
-    if len(parts) == 2:
-        return parts[0].strip(), parts[1].strip()
-    return line.strip(), ""
-
-def parse_text(raw: str) -> List[Tuple[str, str]]:
-    lines = [l.rstrip() for l in raw.splitlines()]
-    rows: List[str] = []
-    buf = ""
+def split_rows(text):
+    """Split text into logical rows by list markers; keep wrapped lines together."""
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    rows = []
+    buf = []
     for ln in lines:
         if not ln.strip():
-            continue
-        if ROW_START_RE.match(ln):
-            # commit previous buffer
-            if buf.strip():
-                rows.append(buf.strip())
-            # remove bullet/number prefix
-            ln = re.sub(r"^\s*(\d+[\.\)]\s+|[-*•]\s+)", "", ln).strip()
-            buf = ln
-        else:
-            # continuation of previous line
+            # keep blank as a separator for paragraphs
             if buf:
-                # join with space
-                buf += " " + ln.strip()
-            else:
-                buf = ln.strip()
-    if buf.strip():
-        rows.append(buf.strip())
-
-    result: List[Tuple[str, str]] = []
-    for r in rows:
-        term, definition = _split_term_def(r)
-        term = term.strip(" —–-")
-        definition = " ".join(definition.split())  # collapse spaces
-        result.append((term, definition))
-    return result
-
-
-# ----------------------------- PDF ----------------------------------
-
-@dataclass
-class FooterConfig:
-    enabled: bool
-    subject: str
-    lesson: str
-    unit: str
-    template: str  # e.g., "{subject} • {lesson}"
-
-def wrap_text(text: str, font: str, size: float, max_width: float) -> List[str]:
-    """Simple greedy word wrap using stringWidth."""
-    words = text.split()
-    lines = []
-    cur = ""
-    for w in words:
-        test = (cur + " " + w).strip()
-        if stringWidth(test, font, size) <= max_width or not cur:
-            cur = test
-        else:
-            lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    if not lines:
-        lines = [""]
-    return lines
-
-def draw_dashed_grid(c: canvas.Canvas, page_w: float, page_h: float, cols: int, rows: int, margin: float):
-    card_w = (page_w - 2*margin) / cols
-    card_h = (page_h - 2*margin) / rows
-    c.setDash(4, 6)
-    c.setStrokeColor(colors.lightgrey)
-    # verticals
-    for i in range(1, cols):
-        x = margin + i*card_w
-        c.line(x, margin, x, page_h - margin)
-    # horizontals
-    for j in range(1, rows):
-        y = margin + j*card_h
-        c.line(margin, y, page_w - margin, y)
-    c.setDash()  # reset
-
-def render_page(c: canvas.Canvas, cards: List[Tuple[str, str]], start_index: int, front: bool, duplex_mode: str,
-                offset_x_mm: float, offset_y_mm: float, footer: FooterConfig, page_num: int,
-                cols: int = 2, rows: int = 4, margin: float = 0.5*inch):
-    page_w, page_h = letter
-    card_w = (page_w - 2*margin) / cols
-    card_h = (page_h - 2*margin) / rows
-
-    # offsets for BACK only
-    dx = (offset_x_mm / 25.4) * inch if not front else 0
-    dy = (offset_y_mm / 25.4) * inch if not front else 0
-
-    # Transform for back mirroring
-    if not front:
-        if duplex_mode == "Long-edge (mirrored back)":
-            # mirror horizontally around page center
-            c.translate(page_w, 0)
-            c.scale(-1, 1)
-        elif duplex_mode == "Short-edge":
-            # rotate 180 degrees
-            c.translate(page_w, page_h)
-            c.rotate(180)
-
-    # draw cut guides
-    draw_dashed_grid(c, page_w, page_h, cols, rows, margin)
-
-    for idx in range(cols*rows):
-        i = idx % cols
-        j = idx // cols
-        x0 = margin + i*card_w + (dx if not front else 0)
-        y0 = margin + (rows-1-j)*card_h + (dy if not front else 0)
-
-        ci = start_index + idx
-        if ci >= len(cards):
+                rows.append(" ".join(buf).strip())
+                buf = []
             continue
-
-        term, definition = cards[ci]
-
-        # Inset
-        pad = 12
-        inner_w = card_w - 2*pad
-        inner_h = card_h - 2*pad
-
-        # Draw content
-        if front:
-            # big term centered
-            title_size = 18
-            # fit term size down if too wide
-            while stringWidth(term, "Helvetica-Bold", title_size) > inner_w and title_size > 10:
-                title_size -= 1
-            c.setFont("Helvetica-Bold", title_size)
-            c.setFillColor(colors.black)
-            c.drawCentredString(x0 + card_w/2, y0 + card_h/2, term)
+        # new-row markers: numbered 1. / 1) or bullets -, •, *
+        if re.match(r'^\s*(\d+)[\.\)]\s+', ln) or re.match(r'^\s*[•\-\*]\s+', ln):
+            if buf:
+                rows.append(" ".join(buf).strip())
+                buf = []
+            # remove the marker
+            ln = re.sub(r'^\s*(?:\d+[\.\)]\s+|[•\-\*]\s+)', '', ln, count=1)
+            buf.append(ln)
         else:
-            # definition block top-left
-            body_size = 11
-            c.setFont("Helvetica", body_size)
-            lines = wrap_text(definition, "Helvetica", body_size, inner_w)
-            top = y0 + card_h - pad - body_size
-            for line in lines[:12]:  # safety cap
-                c.drawString(x0 + pad, top, line)
-                top -= body_size * 1.25
+            buf.append(ln)
+    if buf:
+        rows.append(" ".join(buf).strip())
+    # as a fallback: if no markers at all and multiple lines, treat each non-empty line as its own row
+    if len(rows)==1 and '\n' in text:
+        candidates = [l.strip() for l in text.splitlines() if l.strip()]
+        if len(candidates) > 1:
+            rows = candidates
+    return rows
 
-        # Footer (small)
-        if footer.enabled:
-            tpl = footer.template or "{subject} • {lesson}"
-            txt = tpl.format(subject=footer.subject or "",
-                             lesson=footer.lesson or footer.unit or "",
-                             unit=footer.unit or footer.lesson or "",
-                             index=ci+1,
-                             page=page_num)
-            c.setFont("Helvetica", 8)
-            c.setFillColor(colors.grey)
-            c.drawRightString(x0 + card_w - 6, y0 + 6, txt)
+SEP_REGEXES = [
+    re.compile(r'\t'),                                # tab
+    re.compile(r':(?![^()]*\))'),                    # first colon not inside parentheses
+    re.compile(r'\s—\s|\s–\s|\s-\s'),                # spaced dashes
+]
 
-def build_pdf(cards: List[Tuple[str,str]], duplex_mode: str, offset_x_mm: float, offset_y_mm: float,
-              footer: FooterConfig) -> bytes:
+def parse_term_def(line):
+    # dictionary pattern: term (pos) definition
+    m = re.match(r'^\s*([^()]+?)\s*\([^)]*\)\s+(.+)$', line)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+
+    for rx in SEP_REGEXES:
+        sp = rx.split(line, maxsplit=1)
+        if len(sp)==2:
+            return sp[0].strip(), sp[1].strip()
+
+    # fallback: single token as term, rest as def if possible
+    sp = line.split(None, 1)
+    if len(sp)==2:
+        return sp[0].strip(), sp[1].strip()
+    return line.strip(), ""
+
+def text_to_df(text):
+    text = text.replace('\u2019',"'").replace('\u2013','–').replace('\u2014','—')
+    rows = split_rows(text)
+    data = [parse_term_def(r) for r in rows if r.strip()]
+    df = pd.DataFrame(data, columns=["Front of Flash Card (term)","Back of Flash Card (definition)"])
+    return df
+
+def sheet_layout(pdf, cards):
+    """Compute positions for 8 cards on US Letter portrait (2 cols x 4 rows)."""
+    # margins and grid
+    W, H = letter
+    cols = 2
+    rows = 4
+    gutter = 12 * mm
+    margin_x = 15 * mm
+    margin_y = 18 * mm
+    card_w = (W - 2*margin_x - gutter) / cols
+    card_h = (H - 2*margin_y - gutter* (rows-1)) / rows
+    positions = []
+    for r in range(rows):
+        for c in range(cols):
+            x = margin_x + c*(card_w + gutter)
+            y = H - margin_y - (r+1)*card_h - r*gutter
+            positions.append((x,y,card_w,card_h))
+    return positions
+
+def draw_card(pdf, x,y,w,h, front_text, footer_text=None, small=False):
+    # dashed cut rect
+    pdf.setDash(4,4)
+    pdf.rect(x, y, w, h)
+    pdf.setDash()
+
+    # text box
+    left = x + 10*mm
+    top = y + h - 12*mm
+    max_w = w - 20*mm
+    pdf.setFont("Helvetica-Bold", 14 if not small else 12)
+    pdf.drawString(left, top, front_text[:80])
+
+    # footer
+    if footer_text:
+        pdf.setFont("Helvetica", 9)
+        pdf.setFillColor(black)
+        pdf.drawRightString(x + w - 6*mm, y + 6*mm, footer_text)
+
+def draw_back(pdf, x,y,w,h, back_text, footer_text=None):
+    pdf.setDash(4,4)
+    pdf.rect(x, y, w, h)
+    pdf.setDash()
+
+    left = x + 10*mm
+    top = y + h - 18*mm
+    max_w = w - 20*mm
+    # wrap definition roughly
+    pdf.setFont("Helvetica", 11)
+    # naive wrap
+    words = back_text.split()
+    lines, cur = [], ""
+    for wd in words:
+        test = (cur + " " + wd).strip()
+        if len(test) > 70:
+            lines.append(cur)
+            cur = wd
+        else:
+            cur = test
+    if cur: lines.append(cur)
+    yline = top
+    for ln in lines[:12]:
+        pdf.drawString(left, yline, ln)
+        yline -= 12
+    if footer_text:
+        pdf.setFont("Helvetica", 9)
+        pdf.drawRightString(x + w - 6*mm, y + 6*mm, footer_text)
+
+def build_pdf(cards_df, duplex_mode, offset_x_mm, offset_y_mm, footer_on, subject, lesson, footer_tpl):
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=letter)
-    cols, rows = 2, 4
-    per_page = cols*rows
-    num_pages = math.ceil(len(cards) / per_page)
-    for p in range(num_pages):
-        start = p * per_page
+    pdf = canvas.Canvas(buf, pagesize=letter)
+    pos = sheet_layout(pdf, cards_df)
+    N = len(cards_df)
+    per_page = 8
+
+    def footer(idx, page):
+        if not footer_on:
+            return None
+        local = {
+            "subject": subject or "",
+            "lesson": lesson or "",
+            "unit": lesson or "",
+            "index": idx,
+            "page": page,
+        }
+        try:
+            return footer_tpl.format(**local)
+        except Exception:
+            return f"{subject or ''} {lesson or ''}".strip()
+
+    page = 1
+    for i in range(0, N, per_page):
+        batch = cards_df.iloc[i:i+per_page]
         # FRONT
-        render_page(c, cards, start, front=True, duplex_mode=duplex_mode, offset_x_mm=offset_x_mm,
-                    offset_y_mm=offset_y_mm, footer=footer, page_num=p+1, cols=cols, rows=rows)
-        c.showPage()
+        for j, (_,row) in enumerate(batch.iterrows()):
+            x,y,w,h = pos[j]
+            draw_card(pdf, x,y,w,h, str(row[0]), footer(idx=i+j+1, page=page))
+        pdf.showPage()
+
         # BACK
-        render_page(c, cards, start, front=False, duplex_mode=duplex_mode, offset_x_mm=offset_x_mm,
-                    offset_y_mm=offset_y_mm, footer=footer, page_num=p+1, cols=cols, rows=rows)
-        c.showPage()
-    c.save()
-    return buf.getvalue()
+        # Alignment: Long-edge (not mirrored) vs Short-edge (rotate 180)
+        rotate = (duplex_mode == "Short-edge")
+        # apply offsets
+        offx = offset_x_mm * mm
+        offy = offset_y_mm * mm
 
-# ----------------------------- UI ----------------------------------
+        for j, (_,row) in enumerate(batch.iterrows()):
+            x,y,w,h = pos[j]
+            # For long-edge (not mirrored), keep same positions.
+            # For short-edge, rotate around page center.
+            if rotate:
+                W,H = letter
+                pdf.saveState()
+                pdf.translate(W/2, H/2)
+                pdf.rotate(180)
+                pdf.translate(-W/2, -H/2)
+                draw_back(pdf, x + offx, y + offy, w, h, str(row[1]), footer(idx=i+j+1, page=page))
+                pdf.restoreState()
+            else:
+                draw_back(pdf, x + offx, y + offy, w, h, str(row[1]), footer(idx=i+j+1, page=page))
 
-st.markdown("# ⚡ FlashDecky")
-st.caption("Turn any list into perfect, printable flash cards (8 per page, duplex-ready).")
+        pdf.showPage()
+        page += 1
 
-with st.expander("How to use (quick)", expanded=False):
-    st.write("""
-    1) Paste your list, upload CSV/XLSX, or paste a table.
-    2) Fix anything in **Review & Edit**.
-    3) Pick duplex alignment, enter optional footer, and **Generate PDF**.
-    """)
+    pdf.save()
+    buf.seek(0)
+    return buf
 
-colA, colB, colC = st.columns(3)
-with colA:
-    st.subheader("Paste text")
-    raw_text = st.text_area("Your list", height=220, placeholder="1) term — definition\n2) another term: definition...\n• third term - definition")
-with colB:
-    st.subheader("Upload file (CSV/XLSX)")
-    file = st.file_uploader("Choose a CSV or Excel file", type=["csv","xlsx"])
-with colC:
-    st.subheader("Paste table (Excel/Sheets)")
-    paste_table = st.text_area("Paste a tab-separated table (two columns: term\tdefinition)", height=220, placeholder="term\tdefinition")
+# ---------------------
+# App UI / State
+# ---------------------
 
-# Build initial df from inputs
-data = []
-if raw_text.strip():
-    data = parse_text(raw_text)
-elif paste_table.strip():
-    # accept TSV/CSV-ish
-    lines = [l for l in paste_table.splitlines() if l.strip()]
-    for ln in lines:
-        if "\t" in ln:
-            t, d = ln.split("\t", 1)
-        elif "," in ln:
-            t, d = ln.split(",", 1)
+st.set_page_config(page_title="FlashDecky", page_icon="⚡", layout="wide")
+
+if "step" not in st.session_state:
+    st.session_state.step = 1
+if "cards_df" not in st.session_state:
+    st.session_state.cards_df = None
+
+# Sidebar progress
+with st.sidebar:
+    st.markdown("### Progress")
+    s = st.session_state.step
+    st.markdown(("✅" if s>1 else "➤") + " 1) Upload / Paste")
+    st.markdown(("✅" if s>2 else "➤") + " 2) Review & Edit")
+    st.markdown(("✅" if s>3 else "➤") + " 3) Download PDF")
+
+st.title("⚡ FlashDecky")
+st.caption("Turn any list into perfect, printable flash cards (8 per page, duplex‑ready).")
+
+# STEP 1 -----------------------------------------------------------------
+if st.session_state.step == 1:
+    with st.expander("How to use (quick)", expanded=False):
+        st.markdown("""
+        - Paste text, upload CSV/XLSX, paste a table, or upload an image (PNG/JPG) of a list.
+        - We auto-parse lines like `1) term — definition`, `term : definition`, or `term (v.) definition`.
+        - Click **Submit** to review and edit.
+        """)
+
+    col1,col2,col3 = st.columns([1,1,1])
+    with col1:
+        st.subheader("Paste text")
+        sample = "1) term — definition\n2) another term: definition line wraps ok\n• third term - definition"
+        pasted = st.text_area("Your list", value=sample, height=230, label_visibility="collapsed")
+    with col2:
+        st.subheader("Upload file (CSV/XLSX/PNG/JPG)")
+        file = st.file_uploader("Choose a CSV, Excel, or image file", type=["csv","xlsx","png","jpg","jpeg"], accept_multiple_files=False)
+        uploaded_text = ""
+        if file is not None:
+            if file.type in ("image/png","image/jpeg"):
+                api_key = st.secrets.get("OCR_SPACE_API_KEY", None)
+                text, err = ocr_space(file.read(), api_key)
+                if err:
+                    st.error(f"OCR error: {err}")
+                else:
+                    uploaded_text = text or ""
+                    st.success("Image text extracted ✔")
+                    st.text_area("Extracted text (you can edit)", value=uploaded_text, height=180, key="ocr_out")
+            elif file.type in ("text/csv","application/vnd.ms-excel","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"):
+                try:
+                    if file.type == "text/csv":
+                        df = pd.read_csv(file)
+                    else:
+                        df = pd.read_excel(file)
+                    st.dataframe(df.head())
+                    # map columns if possible
+                    if df.shape[1] >= 2:
+                        c1 = st.selectbox("Front column", options=df.columns, index=0)
+                        c2 = st.selectbox("Back column", options=df.columns, index=1)
+                        uploaded_text = "\n".join([f"{str(a)}\t{str(b)}" for a,b in zip(df[c1], df[c2])])
+                except Exception as e:
+                    st.error(f"Failed to read file: {e}")
+    with col3:
+        st.subheader("Paste table (Excel/Sheets)")
+        st.caption("Paste two columns (Front TAB Back)")
+        table_text = st.text_area("Paste a tab-separated table", value="", height=230, label_visibility="collapsed")
+
+    # Submit
+    st.markdown("---")
+    if st.button("Submit ➜ Review", type="primary"):
+        raw = ""
+        if uploaded_text:
+            raw = uploaded_text
+        elif table_text.strip():
+            raw = table_text
         else:
-            t, d = _split_term_def(ln)
-        data.append((t.strip(), d.strip()))
-elif file is not None:
-    if file.name.lower().endswith(".csv"):
-        df = pd.read_csv(file)
-    else:
-        df = pd.read_excel(file)
-    # try to auto-map first two columns
-    if df.shape[1] >= 2:
-        data = list(zip(df.iloc[:,0].astype(str).tolist(),
-                        df.iloc[:,1].astype(str).tolist()))
+            raw = pasted
 
-# dataframe for editor
-if not data:
-    data = [("munch", "to chew food loudly and completely"),
-            ("bellowed", "to have shouted in a loud deep voice")]
+        df = text_to_df(raw)
+        st.session_state.cards_df = df
+        st.session_state.step = 2
+        st.experimental_rerun()
 
-df_edit = pd.DataFrame(data, columns=["Front of Flash Card (term)", "Back of Flash Card (definition)"])
-st.subheader("2) Review & edit")
-edited = st.data_editor(
-    df_edit,
-    num_rows="dynamic",
-    hide_index=True,
-    use_container_width=True,
-    key="editor",
-)
+# STEP 2 -----------------------------------------------------------------
+if st.session_state.step == 2:
+    st.header("2) Review & edit")
+    st.caption("Click a cell to edit. Add/remove rows if needed.")
+    df = st.session_state.cards_df.copy()
 
-st.subheader("3) Download PDF")
-with st.expander("Print alignment", expanded=True):
-    duplex_mode = st.selectbox("Duplex mode", ["Long-edge (mirrored back)","Long-edge (not mirrored)","Short-edge"], index=0)
-    x_mm = st.number_input("Back page offset X (mm)", value=0.0, step=0.5)
-    y_mm = st.number_input("Back page offset Y (mm)", value=0.0, step=0.5)
-st.write("**Card footer (subject • lesson)**")
-footer_on = st.checkbox("Include footer text on cards", value=True)
-col1, col2, col3 = st.columns(3)
-with col1:
-    subject = st.text_input("Subject", value="")
-with col2:
+    edited = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True
+    )
+    colA, colB = st.columns([1,1])
+    with colA:
+        if st.button("⬅ Back to upload"):
+            st.session_state.step = 1
+            st.experimental_rerun()
+    with colB:
+        if st.button("Continue ➜ Download PDF", type="primary"):
+            st.session_state.cards_df = edited
+            st.session_state.step = 3
+            st.experimental_rerun()
+
+# STEP 3 -----------------------------------------------------------------
+if st.session_state.step == 3:
+    st.header("3) Download PDF")
+
+    with st.expander("Print alignment", expanded=True):
+        duplex = st.selectbox("Duplex mode", ["Long-edge (not mirrored)", "Short-edge"])
+        offx = st.number_input("Back page offset X (mm)", value=0.0, step=0.25)
+        offy = st.number_input("Back page offset Y (mm)", value=0.0, step=0.25)
+        tiny = st.checkbox("Show tiny corner marker", value=False)
+
+    st.subheader("Card footer (subject • lesson)")
+    on = st.checkbox("Include footer text on cards", value=True)
+    subj = st.text_input("Subject", value="")
     lesson = st.text_input("Lesson / Unit", value="")
-with col3:
-    footer_template = st.text_input("Footer template", value="{subject} • {lesson}")
+    tpl = st.text_input("Footer template", value="{subject} • {lesson}")
 
-cards = list(zip(edited["Front of Flash Card (term)"].astype(str),
-                 edited["Back of Flash Card (definition)"].astype(str)))
-footer_cfg = FooterConfig(enabled=footer_on, subject=subject, lesson=lesson, unit=lesson, template=footer_template)
-
-if st.button("Generate PDF", type="primary"):
-    pdf_bytes = build_pdf(cards, duplex_mode=duplex_mode, offset_x_mm=x_mm, offset_y_mm=y_mm, footer=footer_cfg)
-    st.download_button("Download flashdecky.pdf", data=pdf_bytes, file_name="flashdecky.pdf", mime="application/pdf")
-    st.success("PDF generated. Use your printer's **Two-sided** with the chosen duplex mode.")
+    if st.button("Generate PDF", type="primary"):
+        buf = build_pdf(
+            st.session_state.cards_df,
+            duplex_mode = "Short-edge" if duplex=="Short-edge" else "Long-edge (not mirrored)",
+            offset_x_mm = float(offx),
+            offset_y_mm = float(offy),
+            footer_on = on,
+            subject = subj,
+            lesson = lesson,
+            footer_tpl = tpl
+        )
+        st.download_button("Download flashcards.pdf", data=buf, file_name="flashcards.pdf", mime="application/pdf")
+    if st.button("⬅ Back to edit"):
+        st.session_state.step = 2
+        st.experimental_rerun()
