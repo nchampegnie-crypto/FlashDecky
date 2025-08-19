@@ -1,3 +1,2 @@
-# FlashDecky
-
-FlashDecky helps you instantly create flashcards from lists, text, or screenshots.
+# Flashdecky App
+This is the Flashdecky app packaged with repo structure.
